@@ -81,8 +81,8 @@ def optimize_png(png_path: Path) -> None:
             capture_output=True,
         )
     else:
-        # fallback: Pillow re-save with max compression
-        img = Image.open(png_path)
+        # fallback: Pillow re-save with max compression (preserve alpha)
+        img = Image.open(png_path).convert("RGBA")
         img.save(png_path, format="PNG", optimize=True, compress_level=9)
 
     new_size = png_path.stat().st_size
@@ -99,9 +99,12 @@ def generate_normal_map(png_path: Path, out_path: Path, strength: float = 4.0) -
     """
     Generate a tangent-space normal map from a grayscale heightmap.
     The PNG is converted to grayscale, then Sobel gradients are used
-    to compute per-pixel normals, which are packed into RGB (DirectX convention).
+    to compute per-pixel normals, which are packed into RGBA (DirectX convention).
+    Alpha channel is preserved from the source image.
     """
-    img = Image.open(png_path).convert("L")  # grayscale heightmap
+    src = Image.open(png_path).convert("RGBA")
+    alpha = np.array(src.getchannel("A"), dtype=np.uint8)
+    img = src.convert("L")  # grayscale heightmap
     h = np.array(img, dtype=np.float32) / 255.0
 
     # Sobel kernels
@@ -136,7 +139,7 @@ def generate_normal_map(png_path: Path, out_path: Path, strength: float = 4.0) -
     g = ((ny * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
     b = ((nz * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
 
-    normal_img = Image.fromarray(np.stack([r, g, b], axis=-1), mode="RGB")
+    normal_img = Image.fromarray(np.stack([r, g, b, alpha], axis=-1), mode="RGBA")
     normal_img.save(out_path)
     print(f"  [normal]   {out_path.name}")
 

@@ -87,7 +87,9 @@ def optimize_png(png_path: Path, quality: int = 80) -> tuple:
 
 
 def generate_normal_map(png_path: Path, out_path: Path, strength: float, invert: bool = False) -> None:
-    img = Image.open(png_path).convert("L")
+    src = Image.open(png_path).convert("RGBA")
+    alpha = np.array(src.getchannel("A"), dtype=np.uint8)
+    img = src.convert("L")
     h = np.array(img, dtype=np.float32) / 255.0
     kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
     ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
@@ -103,16 +105,14 @@ def generate_normal_map(png_path: Path, out_path: Path, strength: float, invert:
     gx, gy = conv(h, kx) * strength, conv(h, ky) * strength
     gz = np.ones_like(gx)
     length = np.sqrt(gx**2 + gy**2 + gz**2)
-    # invert=False → выпуклое (светлые области выступают вперёд)
-    # invert=True  → вогнутое (светлые области уходят вглубь)
     sign = -1.0 if invert else 1.0
     nx = sign * (-gx / length)
     ny = sign * (-gy / length)
-    nz = gz / length  # Z всегда смотрит на камеру
+    nz = gz / length
     r = ((nx * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
     g = ((ny * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
     b = ((nz * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
-    Image.fromarray(np.stack([r, g, b], axis=-1), mode="RGB").save(out_path)
+    Image.fromarray(np.stack([r, g, b, alpha], axis=-1), mode="RGBA").save(out_path)
 
 
 def collect_svgs(paths):
