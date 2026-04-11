@@ -86,11 +86,26 @@ def optimize_png(png_path: Path, quality: int = 80) -> tuple:
     return original_size, png_path.stat().st_size
 
 
-def generate_normal_map(png_path: Path, out_path: Path, strength: float, invert: bool = False) -> None:
+def generate_normal_map(png_path: Path, out_path: Path, strength: float,
+                        invert: bool = False, blur: float = 0.0,
+                        flip_y: bool = True, use_alpha: bool = True) -> None:
+    from PIL import ImageFilter
     src = Image.open(png_path).convert("RGBA")
     alpha = np.array(src.getchannel("A"), dtype=np.uint8)
-    img = src.convert("L")
-    h = np.array(img, dtype=np.float32) / 255.0
+
+    if use_alpha and alpha.max() > 0:
+        # Режим "по форме": используем альфа-канал как карту высот.
+        # Размываем альфу — получаем плавный объём по краям, плоский центр.
+        blur_radius = max(blur, 1.0)
+        height_img = Image.fromarray(alpha).filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    else:
+        # Режим "по яркости": классический heightmap из grayscale
+        img = src.convert("L")
+        if blur > 0:
+            img = img.filter(ImageFilter.GaussianBlur(radius=blur))
+        height_img = img
+
+    h = np.array(height_img, dtype=np.float32) / 255.0
     kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
     ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
 
@@ -107,11 +122,18 @@ def generate_normal_map(png_path: Path, out_path: Path, strength: float, invert:
     length = np.sqrt(gx**2 + gy**2 + gz**2)
     sign = -1.0 if invert else 1.0
     nx = sign * (-gx / length)
-    ny = sign * (-gy / length)
+    # SVG/PNG Y-ось идёт сверху вниз, Unity ожидает снизу вверх → флип Y
+    ny_sign = sign * (1.0 if flip_y else -1.0)
+    ny = ny_sign * (-gy / length)
     nz = gz / length
     r = ((nx * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
     g = ((ny * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
     b = ((nz * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
+    # Прозрачные пиксели → нейтральная нормаль (128,128,255), не (0,0,0)
+    mask = alpha == 0
+    r[mask] = 128
+    g[mask] = 128
+    b[mask] = 255
     Image.fromarray(np.stack([r, g, b, alpha], axis=-1), mode="RGBA").save(out_path)
 
 
@@ -332,28 +354,65 @@ class App(tk.Tk):
                  bg=BG, fg="#6c7086", font=("Segoe UI", 8)).grid(
             row=5, column=2, sticky="w", padx=(0, 12))
 
-        # Направление нормали: выпуклое / вогнутое
-        ttk.Label(parent, text="Рельеф:").grid(row=6, column=0, sticky="w", **PAD)
+        # Размытие перед генерацией нормали
+        ttk.Label(parent, text="Размытие нормали:").grid(row=6, column=0, sticky="w", **PAD)
+        self.cv_blur_var = tk.DoubleVar(value=2.0)
+        blur_frame = tk.Frame(parent, bg=BG)
+        blur_frame.grid(row=6, column=1, sticky="w", **PAD)
+        self.cv_blur_lbl = tk.Label(blur_frame, text="2.0", width=4,
+                                    bg=BG, fg=ACCENT, font=("Segoe UI", 10, "bold"))
+        self.cv_blur_lbl.pack(side="right")
+        tk.Scale(blur_frame, from_=0.0, to=20.0, resolution=0.5,
+                 orient="horizontal", variable=self.cv_blur_var, length=220,
+                 bg=BG, fg=FG, troughcolor=ENTRY_BG, highlightthickness=0,
+                 activebackground=ACCENT, sliderrelief="flat",
+                 command=lambda v: self.cv_blur_lbl.config(text=f"{float(v):.1f}")
+                 ).pack(side="left")
+        tk.Label(parent, text="← 0 = без сглаживания, выше = мягче нормаль",
+                 bg=BG, fg="#6c7086", font=("Segoe UI", 8)).grid(
+            row=6, column=2, sticky="w", padx=(0, 12))
+
+        # Режим генерации нормали
+        ttk.Label(parent, text="Режим нормали:").grid(row=7, column=0, sticky="w", **PAD)
+        self.cv_use_alpha_var = tk.BooleanVar(value=True)
+        mode_frame = tk.Frame(parent, bg=BG)
+        mode_frame.grid(row=7, column=1, columnspan=2, sticky="w", **PAD)
+        tk.Radiobutton(mode_frame, text="По форме (альфа)  — рекомендуется для 2D спрайтов",
+                       variable=self.cv_use_alpha_var, value=True,
+                       bg=BG, fg=FG, selectcolor=ENTRY_BG,
+                       activebackground=BG, activeforeground=ACCENT,
+                       font=("Segoe UI", 10)).pack(anchor="w")
+        tk.Radiobutton(mode_frame, text="По яркости (grayscale)  — для текстур/heightmap",
+                       variable=self.cv_use_alpha_var, value=False,
+                       bg=BG, fg=FG, selectcolor=ENTRY_BG,
+                       activebackground=BG, activeforeground=ACCENT,
+                       font=("Segoe UI", 10)).pack(anchor="w")
+
+        # Направление нормали: выпуклое / вогнутое + флип Y
+        ttk.Label(parent, text="Рельеф:").grid(row=8, column=0, sticky="w", **PAD)
         self.cv_invert_var = tk.BooleanVar(value=False)
+        self.cv_flip_y_var = tk.BooleanVar(value=True)
         relief_frame = tk.Frame(parent, bg=BG)
-        relief_frame.grid(row=6, column=1, sticky="w", **PAD)
-        tk.Radiobutton(relief_frame, text="Выпуклое  (светлое = вперёд)",
+        relief_frame.grid(row=8, column=1, sticky="w", **PAD)
+        tk.Radiobutton(relief_frame, text="Выпуклое",
                        variable=self.cv_invert_var, value=False,
                        bg=BG, fg=FG, selectcolor=ENTRY_BG,
                        activebackground=BG, activeforeground=ACCENT,
-                       font=("Segoe UI", 10)).pack(side="left", padx=(0, 12))
-        tk.Radiobutton(relief_frame, text="Вогнутое  (светлое = вглубь)",
+                       font=("Segoe UI", 10)).pack(side="left", padx=(0, 8))
+        tk.Radiobutton(relief_frame, text="Вогнутое",
                        variable=self.cv_invert_var, value=True,
                        bg=BG, fg=FG, selectcolor=ENTRY_BG,
                        activebackground=BG, activeforeground=ACCENT,
-                       font=("Segoe UI", 10)).pack(side="left")
+                       font=("Segoe UI", 10)).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(relief_frame, text="Флип Y  (для Unity)",
+                        variable=self.cv_flip_y_var).pack(side="left")
 
         # Качество сжатия
-        ttk.Label(parent, text="Качество сжатия:").grid(row=7, column=0, sticky="w", **PAD)
+        ttk.Label(parent, text="Качество сжатия:").grid(row=9, column=0, sticky="w", **PAD)
         self.cv_quality_var = tk.IntVar(value=80)
         self.cv_no_compress_var = tk.BooleanVar(value=False)
         q_frame = tk.Frame(parent, bg=BG)
-        q_frame.grid(row=7, column=1, sticky="w", **PAD)
+        q_frame.grid(row=9, column=1, sticky="w", **PAD)
         self.cv_quality_lbl = tk.Label(q_frame, text="80", width=4,
                                        bg=BG, fg=ACCENT, font=("Segoe UI", 10, "bold"))
         self.cv_quality_lbl.pack(side="right")
@@ -366,7 +425,7 @@ class App(tk.Tk):
         self.cv_quality_scale.pack(side="left")
         tk.Label(parent, text="← 10 = мелкий файл / хуже  |  100 = крупный / лучше",
                  bg=BG, fg="#6c7086", font=("Segoe UI", 8)).grid(
-            row=7, column=2, sticky="w", padx=(0, 12))
+            row=9, column=2, sticky="w", padx=(0, 12))
 
         def _toggle_compress():
             state = "disabled" if self.cv_no_compress_var.get() else "normal"
@@ -374,7 +433,7 @@ class App(tk.Tk):
             self.cv_quality_lbl.configure(fg="#6c7086" if self.cv_no_compress_var.get() else ACCENT)
 
         no_compress_frame = tk.Frame(parent, bg=BG)
-        no_compress_frame.grid(row=7, column=2, sticky="e", padx=(0, 12))
+        no_compress_frame.grid(row=9, column=2, sticky="e", padx=(0, 12))
         ttk.Checkbutton(no_compress_frame, text="Без сжатия",
                         variable=self.cv_no_compress_var,
                         command=_toggle_compress).pack(side="right")
@@ -382,18 +441,18 @@ class App(tk.Tk):
         # Удалить исходник
         self.cv_delete_src_var = tk.BooleanVar(value=False)
         del_frame = tk.Frame(parent, bg=BG)
-        del_frame.grid(row=8, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
+        del_frame.grid(row=10, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
         ttk.Checkbutton(del_frame, text="Удалить исходный SVG после конвертации",
                         variable=self.cv_delete_src_var).pack(side="left")
 
         self.cv_progress = ttk.Progressbar(parent, length=400, mode="determinate")
-        self.cv_progress.grid(row=9, column=0, columnspan=3, padx=16, pady=(6, 4))
+        self.cv_progress.grid(row=11, column=0, columnspan=3, padx=16, pady=(6, 4))
 
-        self.cv_log = self._make_log(parent, row=10)
+        self.cv_log = self._make_log(parent, row=12)
 
         self.cv_run_btn = ttk.Button(parent, text="▶  Конвертировать",
                                      style="Accent.TButton", command=self._cv_start)
-        self.cv_run_btn.grid(row=11, column=0, columnspan=3, pady=(8, 16), ipadx=20, ipady=6)
+        self.cv_run_btn.grid(row=13, column=0, columnspan=3, pady=(8, 16), ipadx=20, ipady=6)
 
     def _cv_pick_files(self):
         files = filedialog.askopenfilenames(filetypes=[("SVG files", "*.svg")])
@@ -428,11 +487,13 @@ class App(tk.Tk):
         threading.Thread(target=self._cv_pipeline,
                          args=(svgs, output_dir, self.cv_dpi_var.get(),
                                self.cv_scale_var.get(), self.cv_strength_var.get(),
-                               self.cv_quality_var.get(), self.cv_invert_var.get(),
+                               self.cv_blur_var.get(), self.cv_quality_var.get(),
+                               self.cv_invert_var.get(), self.cv_flip_y_var.get(),
+                               self.cv_use_alpha_var.get(),
                                self.cv_no_compress_var.get(), self.cv_delete_src_var.get()),
                          daemon=True).start()
 
-    def _cv_pipeline(self, svgs, output_dir, dpi, scale, strength, quality, invert, no_compress, delete_src):
+    def _cv_pipeline(self, svgs, output_dir, dpi, scale, strength, blur, quality, invert, flip_y, use_alpha, no_compress, delete_src):
         errors = 0
         for i, svg in enumerate(svgs, 1):
             try:
@@ -450,7 +511,7 @@ class App(tk.Tk):
                     orig, new = optimize_png(png_path, quality)
                     pct = (orig - new) / orig * 100 if orig else 0
                     self._log(self.cv_log, f"  ✓ оптимизирован  {orig//1024}KB → {new//1024}KB  (−{pct:.1f}%)")
-                generate_normal_map(png_path, normal_path, strength, invert)
+                generate_normal_map(png_path, normal_path, strength, invert, blur, flip_y, use_alpha)
                 self._log(self.cv_log, f"  ✓ normal map     → {normal_path.name}")
                 if delete_src:
                     svg.unlink()
@@ -874,40 +935,77 @@ class App(tk.Tk):
                  bg=BG, fg="#6c7086", font=("Segoe UI", 8)).grid(
             row=3, column=2, sticky="w", padx=(0, 12))
 
+        # Размытие
+        ttk.Label(parent, text="Размытие:").grid(row=4, column=0, sticky="w", **PAD)
+        self.nm_blur_var = tk.DoubleVar(value=2.0)
+        nm_blur_frame = tk.Frame(parent, bg=BG)
+        nm_blur_frame.grid(row=4, column=1, sticky="w", **PAD)
+        self.nm_blur_lbl = tk.Label(nm_blur_frame, text="2.0", width=4,
+                                    bg=BG, fg=ACCENT, font=("Segoe UI", 10, "bold"))
+        self.nm_blur_lbl.pack(side="right")
+        tk.Scale(nm_blur_frame, from_=0.0, to=20.0, resolution=0.5,
+                 orient="horizontal", variable=self.nm_blur_var, length=220,
+                 bg=BG, fg=FG, troughcolor=ENTRY_BG, highlightthickness=0,
+                 activebackground=ACCENT, sliderrelief="flat",
+                 command=lambda v: self.nm_blur_lbl.config(text=f"{float(v):.1f}")
+                 ).pack(side="left")
+        tk.Label(parent, text="← 0 = без сглаживания, выше = мягче нормаль",
+                 bg=BG, fg="#6c7086", font=("Segoe UI", 8)).grid(
+            row=4, column=2, sticky="w", padx=(0, 12))
+
+        # Режим генерации нормали
+        ttk.Label(parent, text="Режим нормали:").grid(row=5, column=0, sticky="w", **PAD)
+        self.nm_use_alpha_var = tk.BooleanVar(value=True)
+        nm_mode_frame = tk.Frame(parent, bg=BG)
+        nm_mode_frame.grid(row=5, column=1, columnspan=2, sticky="w", **PAD)
+        tk.Radiobutton(nm_mode_frame, text="По форме (альфа)  — рекомендуется для 2D спрайтов",
+                       variable=self.nm_use_alpha_var, value=True,
+                       bg=BG, fg=FG, selectcolor=ENTRY_BG,
+                       activebackground=BG, activeforeground=ACCENT,
+                       font=("Segoe UI", 10)).pack(anchor="w")
+        tk.Radiobutton(nm_mode_frame, text="По яркости (grayscale)  — для текстур/heightmap",
+                       variable=self.nm_use_alpha_var, value=False,
+                       bg=BG, fg=FG, selectcolor=ENTRY_BG,
+                       activebackground=BG, activeforeground=ACCENT,
+                       font=("Segoe UI", 10)).pack(anchor="w")
+
         # Рельеф
-        ttk.Label(parent, text="Рельеф:").grid(row=4, column=0, sticky="w", **PAD)
+        ttk.Label(parent, text="Рельеф:").grid(row=6, column=0, sticky="w", **PAD)
         self.nm_invert_var = tk.BooleanVar(value=False)
+        self.nm_flip_y_var = tk.BooleanVar(value=True)
         nm_relief_frame = tk.Frame(parent, bg=BG)
-        nm_relief_frame.grid(row=4, column=1, sticky="w", **PAD)
-        tk.Radiobutton(nm_relief_frame, text="Выпуклое  (светлое = вперёд)",
+        nm_relief_frame.grid(row=6, column=1, sticky="w", **PAD)
+        tk.Radiobutton(nm_relief_frame, text="Выпуклое",
                        variable=self.nm_invert_var, value=False,
                        bg=BG, fg=FG, selectcolor=ENTRY_BG,
                        activebackground=BG, activeforeground=ACCENT,
-                       font=("Segoe UI", 10)).pack(side="left", padx=(0, 12))
-        tk.Radiobutton(nm_relief_frame, text="Вогнутое  (светлое = вглубь)",
+                       font=("Segoe UI", 10)).pack(side="left", padx=(0, 8))
+        tk.Radiobutton(nm_relief_frame, text="Вогнутое",
                        variable=self.nm_invert_var, value=True,
                        bg=BG, fg=FG, selectcolor=ENTRY_BG,
                        activebackground=BG, activeforeground=ACCENT,
-                       font=("Segoe UI", 10)).pack(side="left")
+                       font=("Segoe UI", 10)).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(nm_relief_frame, text="Флип Y  (для Unity)",
+                        variable=self.nm_flip_y_var).pack(side="left")
 
         # Суффикс выходного файла
-        ttk.Label(parent, text="Суффикс имени:").grid(row=5, column=0, sticky="w", **PAD)
+        ttk.Label(parent, text="Суффикс имени:").grid(row=7, column=0, sticky="w", **PAD)
         self.nm_suffix_var = tk.StringVar(value="_normal")
         tk.Entry(parent, textvariable=self.nm_suffix_var, width=20,
                  bg=ENTRY_BG, fg=FG, insertbackground=FG,
-                 relief="flat", font=("Segoe UI", 10)).grid(row=5, column=1, sticky="w", **PAD)
+                 relief="flat", font=("Segoe UI", 10)).grid(row=7, column=1, sticky="w", **PAD)
         tk.Label(parent, text="← напр. _normal → image_normal.png",
                  bg=BG, fg="#6c7086", font=("Segoe UI", 8)).grid(
-            row=5, column=2, sticky="w", padx=(0, 12))
+            row=7, column=2, sticky="w", padx=(0, 12))
 
         self.nm_progress = ttk.Progressbar(parent, length=400, mode="determinate")
-        self.nm_progress.grid(row=6, column=0, columnspan=3, padx=16, pady=(10, 4))
+        self.nm_progress.grid(row=8, column=0, columnspan=3, padx=16, pady=(10, 4))
 
-        self.nm_log = self._make_log(parent, row=7)
+        self.nm_log = self._make_log(parent, row=9)
 
         self.nm_run_btn = ttk.Button(parent, text="▶  Генерировать Normal Map",
                                      style="Accent.TButton", command=self._nm_start)
-        self.nm_run_btn.grid(row=8, column=0, columnspan=3, pady=(8, 16), ipadx=20, ipady=6)
+        self.nm_run_btn.grid(row=10, column=0, columnspan=3, pady=(8, 16), ipadx=20, ipady=6)
 
     def _nm_pick_files(self):
         files = filedialog.askopenfilenames(
@@ -951,10 +1049,12 @@ class App(tk.Tk):
         threading.Thread(
             target=self._nm_pipeline,
             args=(pngs, output_dir, self.nm_strength_var.get(),
-                  self.nm_invert_var.get(), self.nm_suffix_var.get()),
+                  self.nm_blur_var.get(), self.nm_invert_var.get(),
+                  self.nm_flip_y_var.get(), self.nm_use_alpha_var.get(),
+                  self.nm_suffix_var.get()),
             daemon=True).start()
 
-    def _nm_pipeline(self, pngs, output_dir, strength, invert, suffix):
+    def _nm_pipeline(self, pngs, output_dir, strength, blur, invert, flip_y, use_alpha, suffix):
         errors = 0
         for i, png in enumerate(pngs, 1):
             try:
@@ -962,7 +1062,7 @@ class App(tk.Tk):
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_path = out_dir / (png.stem + suffix + ".png")
                 self._log(self.nm_log, f"▶ {png.name}")
-                generate_normal_map(png, out_path, strength, invert)
+                generate_normal_map(png, out_path, strength, invert, blur, flip_y, use_alpha)
                 self._log(self.nm_log, f"  ✓ → {out_path.name}")
             except Exception as e:
                 self._log(self.nm_log, f"  ✗ Ошибка: {e}")
