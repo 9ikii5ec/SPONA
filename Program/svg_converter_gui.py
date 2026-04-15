@@ -438,12 +438,15 @@ class App(tk.Tk):
                         variable=self.cv_no_compress_var,
                         command=_toggle_compress).pack(side="right")
 
-        # Удалить исходник
+        # Удалить исходник + не генерировать нормаль
         self.cv_delete_src_var = tk.BooleanVar(value=False)
+        self.cv_skip_normal_var = tk.BooleanVar(value=False)
         del_frame = tk.Frame(parent, bg=BG)
         del_frame.grid(row=10, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
         ttk.Checkbutton(del_frame, text="Удалить исходный SVG после конвертации",
-                        variable=self.cv_delete_src_var).pack(side="left")
+                        variable=self.cv_delete_src_var).pack(side="left", padx=(0, 20))
+        ttk.Checkbutton(del_frame, text="Не генерировать карту нормали",
+                        variable=self.cv_skip_normal_var).pack(side="left")
 
         self.cv_progress = ttk.Progressbar(parent, length=400, mode="determinate")
         self.cv_progress.grid(row=11, column=0, columnspan=3, padx=16, pady=(6, 4))
@@ -489,11 +492,11 @@ class App(tk.Tk):
                                self.cv_scale_var.get(), self.cv_strength_var.get(),
                                self.cv_blur_var.get(), self.cv_quality_var.get(),
                                self.cv_invert_var.get(), self.cv_flip_y_var.get(),
-                               self.cv_use_alpha_var.get(),
+                               self.cv_use_alpha_var.get(), self.cv_skip_normal_var.get(),
                                self.cv_no_compress_var.get(), self.cv_delete_src_var.get()),
                          daemon=True).start()
 
-    def _cv_pipeline(self, svgs, output_dir, dpi, scale, strength, blur, quality, invert, flip_y, use_alpha, no_compress, delete_src):
+    def _cv_pipeline(self, svgs, output_dir, dpi, scale, strength, blur, quality, invert, flip_y, use_alpha, skip_normal, no_compress, delete_src):
         errors = 0
         for i, svg in enumerate(svgs, 1):
             try:
@@ -511,8 +514,11 @@ class App(tk.Tk):
                     orig, new = optimize_png(png_path, quality)
                     pct = (orig - new) / orig * 100 if orig else 0
                     self._log(self.cv_log, f"  ✓ оптимизирован  {orig//1024}KB → {new//1024}KB  (−{pct:.1f}%)")
-                generate_normal_map(png_path, normal_path, strength, invert, blur, flip_y, use_alpha)
-                self._log(self.cv_log, f"  ✓ normal map     → {normal_path.name}")
+                if skip_normal:
+                    self._log(self.cv_log, f"  — normal map пропущена")
+                else:
+                    generate_normal_map(png_path, normal_path, strength, invert, blur, flip_y, use_alpha)
+                    self._log(self.cv_log, f"  ✓ normal map     → {normal_path.name}")
                 if delete_src:
                     svg.unlink()
                     self._log(self.cv_log, f"  🗑 исходник удалён: {svg.name}")
